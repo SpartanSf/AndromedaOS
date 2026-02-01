@@ -12,7 +12,7 @@ _G.Darwin.Logger:Msg("\n" .. [[
 +--------------------------------------------------------------+
 |Hi there!                                                     |
 |If you're reading this, something *probably* went wrong.      |
-|Contact tocatwastaken on Discord for support with AndromedaOS.|
+|Make an issue at https://github.com/tocatwastaken/AndromedaOS |
 |Otherwise, if you know what you're doing, have fun!           |
 +--------------------------------------------------------------+]])
 _G.Darwin.Logger:Msg("Darwin::Boot: " .. Info:FetchOSString())
