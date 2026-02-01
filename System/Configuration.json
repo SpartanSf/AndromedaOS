@@ -1,6 +1,6 @@
 {
     "PList": {
         "Hostname": "andromeda",
-        "KernelArgs": "-v"
+        "KernelArgs": ""
     }
 }
