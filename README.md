@@ -1,4 +1,5 @@
-# AndromedaOS  
+# AndromedaOS BETA BRANCH  
+Note: This branch is used for bleeding edge builds, and may be buggy!
 Version 2026.1  
 This is the source code to my WIP ComputerCraft OS!
 # Getting Started
