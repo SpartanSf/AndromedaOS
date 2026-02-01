@@ -22,6 +22,7 @@ function prettyname(str)
     if str == "home" then
         return "~"
     end
+    return str
 end
 
 while running do
