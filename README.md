@@ -3,6 +3,7 @@ Note: This branch is used for bleeding edge builds, and may be buggy!
 Version 2026.1  
 This is the source code to my WIP ComputerCraft OS!
 # Getting Started
+Note: This requires [Tom's Peripherals](https://www.curseforge.com/minecraft/mc-mods/toms-peripherals)!  
 Simply clone the repo to your computer to get started.
 You can find your computer's drive in the folder (minecraft install)/saves/(world name)/computercraft/computer/(your computer id, can be found with the id command)  
 If you don't see your computer, make a folder first and it should pop up!  
