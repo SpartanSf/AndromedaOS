@@ -3,18 +3,23 @@ term.clear();
 term.setCursorPos(1, 1)
 _G.Darwin = {}
 local Info = require '/System/Libraries/Darwin/info'
+local Config = require '/System/Libraries/Darwin/config'
 _G.os.version = function()
     return Info:FetchOSString()
 end
 _G.Darwin.Logger = require '/System/Libraries/Darwin/logger'
-_G.Darwin.Logger:Init()
+if (string.find(Config:FetchValueFromKey("KernelArgs"), "-v")) then
+    _G.Darwin.Logger:Init(true)
+else
+    _G.Darwin.Logger.Init(false)
+end
 _G.Darwin.Logger:Msg("\n" .. [[
 +--------------------------------------------------------------+
 |Hi there!                                                     |
 |If you're reading this, something *probably* went wrong.      |
 |Make an issue at https://github.com/tocatwastaken/AndromedaOS |
 |Otherwise, if you know what you're doing, have fun!           |
-+--------------------------------------------------------------+]])
++--------------------------------------------------------------+]], true)
 _G.Darwin.Logger:Msg("Darwin::Boot: " .. Info:FetchOSString())
 _G.Darwin.Logger:Msg("Darwin::Boot: Loading Drivers...")
 _G.Darwin.DriverLoader = require '/System/Libraries/Darwin/driverloader'
@@ -50,4 +55,4 @@ end, function(error)
     end
     os.reboot()
 end)
-shell.run("/System/Applications/Shell.app/Contents/AndromedaOS/hello.lua")
+shell.run("/System/Libraries/Darwin/runapp.lua", "/System/Applications/Shell.app")
