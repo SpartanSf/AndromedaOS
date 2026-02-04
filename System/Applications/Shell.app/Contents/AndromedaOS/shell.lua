@@ -2,22 +2,121 @@ local cepheus = _G.cepheus or require("cepheus")
 
 local Shell = {}
 Shell.aliases = {}
+Shell.functions = {}
 Shell.path = "/Programs:/System/Programs:/System/Applications"
 Shell.currentDir = "/"
 Shell.completionFunctions = {}
 Shell.history = {}
-Shell.maxHistory = 100
+Shell.maxHistory = 1000
+Shell.variables = {}
+Shell.exitStatus = 0
+Shell.jobs = {}
+Shell.nextJobId = 1
+Shell.foregroundJob = nil
+Shell.lastBackgroundPid = nil
+
+Shell.variables.HOME = "/"
+Shell.variables.PATH = Shell.path
+Shell.variables.USER = "unknown"
+Shell.variables.SHELL = "/System/Programs/shell.lua"
+Shell.variables.PWD = "/"
+Shell.variables.OLDPWD = "/"
+Shell.variables.HOSTNAME = "localhost"
+Shell.variables.EDITOR = "edit"
+Shell.variables.PAGER = "less"
+
+local PipeBuffer = {}
+PipeBuffer.__index = PipeBuffer
+
+function PipeBuffer.new()
+	local self = setmetatable({}, PipeBuffer)
+	self.data = {}
+	self.position = 1
+	self.closed = false
+	return self
+end
+
+function PipeBuffer:write(text)
+	if self.closed then
+		error("Attempt to write to closed pipe")
+	end
+	table.insert(self.data, tostring(text))
+end
+
+function PipeBuffer:writeLine(text)
+	self:write(tostring(text) .. "\n")
+end
+
+function PipeBuffer:readLine()
+	if self.position > #self.data then
+		return nil
+	end
+
+	local content = table.concat(self.data, "")
+	local lines = {}
+	for line in content:gmatch("[^\n]*\n?") do
+		if line ~= "" then
+			table.insert(lines, line:gsub("\n$", ""))
+		end
+	end
+
+	if self.position <= #lines then
+		local line = lines[self.position]
+		self.position = self.position + 1
+		return line
+	end
+
+	return nil
+end
+
+function PipeBuffer:readAll()
+	return table.concat(self.data, "")
+end
+
+function PipeBuffer:close()
+	self.closed = true
+end
+
+local FileStream = {}
+FileStream.__index = FileStream
+
+function FileStream.new(handle)
+	local self = setmetatable({}, FileStream)
+	self.handle = handle
+	return self
+end
+
+function FileStream:write(text)
+	self.handle.write(tostring(text))
+end
+
+function FileStream:writeLine(text)
+	self.handle.write(tostring(text) .. "\n")
+end
+
+function FileStream:readLine()
+	return self.handle.readLine()
+end
+
+function FileStream:readAll()
+	return self.handle.readAll()
+end
+
+function FileStream:close()
+	self.handle.close()
+end
 
 local function getHostname()
 	if _G.Config and type(_G.Config.FetchValueFromKey) == "function" then
 		return _G.Config:FetchValueFromKey("Hostname") or "localhost"
 	end
-	return "localhost"
+	return Shell.variables.HOSTNAME or "localhost"
 end
 
 local function getUsername()
 	local user = cepheus.users.getCurrentUser()
 	if user then
+		Shell.variables.USER = user.username
 		return user.username
 	end
 	return "unknown"
@@ -26,6 +125,7 @@ end
 local function getDisplayPath()
 	local user = cepheus.users.getCurrentUser()
 	if user and user.home then
+		Shell.variables.HOME = user.home
 		if Shell.currentDir == user.home then
 			return "~"
 		elseif Shell.currentDir:sub(1, #user.home + 1) == user.home .. "/" then
@@ -38,6 +138,98 @@ local function getDisplayPath()
 	end
 
 	return fs.getName(Shell.currentDir)
+end
+
+local function expandVariables(str)
+	str = str:gsub("%$%{([^}]+)%}", function(varname)
+		return Shell.variables[varname] or ""
+	end)
+
+	str = str:gsub("%$([A-Za-z_][A-Za-z0-9_]*)", function(varname)
+		if varname == "?" then
+			return tostring(Shell.exitStatus)
+		elseif varname == "$" then
+			return tostring(cepheus.sched.getPid())
+		elseif varname == "!" then
+			return tostring(Shell.lastBackgroundPid or "")
+		end
+		return Shell.variables[varname] or ""
+	end)
+
+	if str:sub(1, 1) == "~" then
+		if str == "~" or str:sub(2, 2) == "/" then
+			local home = Shell.variables.HOME or "/"
+			str = home .. str:sub(2)
+		end
+	end
+
+	return str
+end
+
+local function expandGlob(pattern)
+	pattern = expandVariables(pattern)
+
+	if not pattern:match("[*?%[]") then
+		return { pattern }
+	end
+
+	local dir = fs.getDir(pattern)
+	if dir == "" then
+		dir = Shell.currentDir
+	else
+		dir = resolvePath(dir)
+	end
+
+	local filePattern = fs.getName(pattern)
+
+	local luaPattern = filePattern:gsub("([%.%-%+%^%$%(%)%%])", "%%%1")
+	luaPattern = luaPattern:gsub("%*", ".*")
+	luaPattern = luaPattern:gsub("%?", ".")
+	luaPattern = "^" .. luaPattern .. "$"
+
+	local results = {}
+	if fs.exists(dir) and fs.isDir(dir) then
+		for _, file in ipairs(fs.list(dir)) do
+			if file:match(luaPattern) then
+				table.insert(results, fs.combine(dir, file))
+			end
+		end
+	end
+
+	table.sort(results)
+	return #results > 0 and results or { pattern }
+end
+
+local function expandBraces(str)
+	local result = { str }
+
+	while true do
+		local expanded = false
+		local newResult = {}
+
+		for _, s in ipairs(result) do
+			local start, finish = s:find("%{[^{}]*%}")
+			if start then
+				local before = s:sub(1, start - 1)
+				local braceContent = s:sub(start + 1, finish - 1)
+				local after = s:sub(finish + 1)
+
+				for item in braceContent:gmatch("[^,]+") do
+					table.insert(newResult, before .. item .. after)
+				end
+				expanded = true
+			else
+				table.insert(newResult, s)
+			end
+		end
+
+		result = newResult
+		if not expanded then
+			break
+		end
+	end
+
+	return result
 end
 
 local function resolveProgram(program)
@@ -98,12 +290,18 @@ local function parseCommandLine(commandLine)
 	local current = ""
 	local inQuotes = false
 	local quoteChar = nil
+	local escape = false
 	local i = 1
 
 	while i <= #commandLine do
 		local char = commandLine:sub(i, i)
 
-		if inQuotes then
+		if escape then
+			current = current .. char
+			escape = false
+		elseif char == "\\" and not inQuotes then
+			escape = true
+		elseif inQuotes then
 			if char == quoteChar then
 				inQuotes = false
 				quoteChar = nil
@@ -133,122 +331,751 @@ local function parseCommandLine(commandLine)
 end
 
 local function resolvePath(path)
+	path = expandVariables(path)
+
 	if path:sub(1, 1) == "/" then
 		return path
 	end
 	return fs.combine(Shell.currentDir, path)
 end
 
+local function parseCommandPipeline(commandLine)
+	local commands = {}
+	local currentCmd = {
+		cmd = "",
+		stdin = nil,
+		stdout = nil,
+		stderr = nil,
+		append = false,
+		background = false,
+	}
+
+	local i = 1
+	local inQuotes = false
+	local quoteChar = nil
+
+	while i <= #commandLine do
+		local char = commandLine:sub(i, i)
+		local nextChar = commandLine:sub(i + 1, i + 1)
+
+		if inQuotes then
+			if char == quoteChar then
+				inQuotes = false
+				quoteChar = nil
+			end
+			currentCmd.cmd = currentCmd.cmd .. char
+		elseif char == '"' or char == "'" then
+			inQuotes = true
+			quoteChar = char
+			currentCmd.cmd = currentCmd.cmd .. char
+		elseif char == "|" then
+			table.insert(commands, currentCmd)
+			currentCmd = {
+				cmd = "",
+				stdin = nil,
+				stdout = nil,
+				stderr = nil,
+				append = false,
+				background = false,
+			}
+		elseif char == ">" then
+			if nextChar == ">" then
+				currentCmd.append = true
+				i = i + 1
+			end
+			i = i + 1
+			while i <= #commandLine and (commandLine:sub(i, i) == " " or commandLine:sub(i, i) == "\t") do
+				i = i + 1
+			end
+			local filename = ""
+			while
+				i <= #commandLine
+				and commandLine:sub(i, i) ~= " "
+				and commandLine:sub(i, i) ~= "\t"
+				and commandLine:sub(i, i) ~= "|"
+				and commandLine:sub(i, i) ~= ">"
+				and commandLine:sub(i, i) ~= "<"
+			do
+				filename = filename .. commandLine:sub(i, i)
+				i = i + 1
+			end
+			currentCmd.stdout = filename
+			i = i - 1
+		elseif char == "<" then
+			i = i + 1
+			while i <= #commandLine and (commandLine:sub(i, i) == " " or commandLine:sub(i, i) == "\t") do
+				i = i + 1
+			end
+			local filename = ""
+			while
+				i <= #commandLine
+				and commandLine:sub(i, i) ~= " "
+				and commandLine:sub(i, i) ~= "\t"
+				and commandLine:sub(i, i) ~= "|"
+				and commandLine:sub(i, i) ~= ">"
+				and commandLine:sub(i, i) ~= "<"
+			do
+				filename = filename .. commandLine:sub(i, i)
+				i = i + 1
+			end
+			currentCmd.stdin = filename
+			i = i - 1
+		elseif char == "2" and nextChar == ">" then
+			i = i + 2
+			if commandLine:sub(i, i) == "&" and commandLine:sub(i + 1, i + 1) == "1" then
+				currentCmd.stderr = "stdout"
+				i = i + 1
+			else
+				while i <= #commandLine and (commandLine:sub(i, i) == " " or commandLine:sub(i, i) == "\t") do
+					i = i + 1
+				end
+				local filename = ""
+				while
+					i <= #commandLine
+					and commandLine:sub(i, i) ~= " "
+					and commandLine:sub(i, i) ~= "\t"
+					and commandLine:sub(i, i) ~= "|"
+				do
+					filename = filename .. commandLine:sub(i, i)
+					i = i + 1
+				end
+				currentCmd.stderr = filename
+				i = i - 1
+			end
+		elseif char == "&" and (i == #commandLine or commandLine:sub(i + 1, i + 1):match("%s")) then
+			currentCmd.background = true
+		else
+			currentCmd.cmd = currentCmd.cmd .. char
+		end
+
+		i = i + 1
+	end
+
+	if currentCmd.cmd:match("%S") then
+		table.insert(commands, currentCmd)
+	end
+
+	return commands
+end
+
 local builtins = {}
 
-function builtins.cd(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local paths = cepheus.parsing.getPositionalArgs(parsed)
-	local target = paths[1] or "/"
+function builtins.cd(args)
+	local targetDir
 
-	if target == ".." then
-		Shell.currentDir = fs.getDir(Shell.currentDir)
-		if Shell.currentDir == "" then
-			Shell.currentDir = "/"
-		end
-	elseif target == "." then
-	elseif target == "/" then
-		Shell.currentDir = "/"
-	elseif target == "~" then
-		local user = cepheus.users.getCurrentUser()
-		if user and user.home then
-			Shell.currentDir = user.home
-		else
-			Shell.currentDir = "/"
-		end
-	elseif target:sub(1, 1) == "/" then
-		if fs.exists(target) and fs.isDir(target) then
-			Shell.currentDir = target
-		else
-			cepheus.term.printError("cd: " .. target .. ": No such directory")
-		end
+	if #args == 0 then
+		targetDir = Shell.variables.HOME or "/"
+	elseif args[1] == "-" then
+		targetDir = Shell.variables.OLDPWD or Shell.currentDir
+		cepheus.term.print(targetDir)
 	else
-		local newDir = fs.combine(Shell.currentDir, target)
-		if fs.exists(newDir) and fs.isDir(newDir) then
-			Shell.currentDir = newDir
-		else
-			cepheus.term.printError("cd: " .. target .. ": No such directory")
-		end
-	end
-end
-
-function builtins.pwd(rawArgs)
-	cepheus.term.print(Shell.currentDir)
-end
-
-function builtins.ls(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local paths = cepheus.parsing.getPositionalArgs(parsed)
-	local longFormat = cepheus.parsing.hasFlag(parsed, "l", { "long" })
-	local showAll = cepheus.parsing.hasFlag(parsed, "a", { "all" })
-
-	local target = paths[1] or Shell.currentDir
-	if paths[1] then
-		target = resolvePath(target)
+		targetDir = args[1]
 	end
 
-	if not fs.exists(target) then
-		cepheus.term.printError("ls: " .. target .. ": No such file or directory")
+	targetDir = resolvePath(targetDir)
+
+	if not fs.exists(targetDir) then
+		cepheus.term.printError("cd: " .. targetDir .. ": No such file or directory")
+		Shell.exitStatus = 1
 		return
 	end
 
-	if not fs.isDir(target) then
-		if longFormat then
-			local stat = cepheus.perms.stat(target)
-			if stat then
-				local ownerName = "unknown"
-				local ownerInfo = cepheus.users.getUserInfo(stat.uid)
-				if ownerInfo then
-					ownerName = ownerInfo.username or "unknown"
-				end
+	if not fs.isDir(targetDir) then
+		cepheus.term.printError("cd: " .. targetDir .. ": Not a directory")
+		Shell.exitStatus = 1
+		return
+	end
 
-				local perms = cepheus.perms.formatPerms(stat.perms)
-				local typeChar = stat.isDir and "d" or "-"
+	Shell.variables.OLDPWD = Shell.currentDir
+	Shell.currentDir = targetDir
+	Shell.variables.PWD = targetDir
+	Shell.exitStatus = 0
+end
 
-				cepheus.term.print(
-					string.format(
-						"%s%s %-8s %4d %8d %s",
-						typeChar,
-						perms,
-						ownerName:sub(1, 8),
-						stat.gid,
-						stat.size,
-						fs.getName(target)
-					)
-				)
+function builtins.pwd(args)
+	local parsed = cepheus.parsing.parseArgs(args)
+	if cepheus.parsing.hasFlag(parsed, "L") then
+		cepheus.term.print(Shell.currentDir)
+	else
+		-- I don't have symlinks yet
+		cepheus.term.print(Shell.currentDir)
+	end
+	Shell.exitStatus = 0
+end
+
+function builtins.echo(args)
+	local parsed = cepheus.parsing.parseArgs(args)
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
+
+	local output = table.concat(positional, " ")
+
+	if cepheus.parsing.hasFlag(parsed, "n") then
+		cepheus.term.write(output)
+	else
+		cepheus.term.print(output)
+	end
+
+	Shell.exitStatus = 0
+end
+
+function builtins.printf(args)
+	if #args == 0 then
+		Shell.exitStatus = 0
+		return
+	end
+
+	local format = args[1]
+	local values = {}
+	for i = 2, #args do
+		table.insert(values, args[i])
+	end
+
+	local output = string.format(format, table.unpack(values))
+	cepheus.term.write(output)
+	Shell.exitStatus = 0
+end
+
+function builtins.export(args)
+	if #args == 0 then
+		for name, value in pairs(Shell.variables) do
+			cepheus.term.print(string.format('export %s="%s"', name, value))
+		end
+		Shell.exitStatus = 0
+		return
+	end
+
+	local i = 1
+	while i <= #args do
+		local arg = args[i]
+		local name, value = arg:match("^([^=]+)=(.*)$")
+
+		if name then
+			Shell.variables[name] = value
+			if name == "PATH" then
+				Shell.path = value
+			end
+			i = i + 1
+		elseif i + 2 <= #args and args[i + 1] == "=" then
+			name = args[i]
+			value = args[i + 2]
+			Shell.variables[name] = value
+			if name == "PATH" then
+				Shell.path = value
+			end
+			i = i + 3
+		else
+			if not Shell.variables[arg] then
+				Shell.variables[arg] = ""
+			end
+			i = i + 1
+		end
+	end
+
+	Shell.exitStatus = 0
+end
+
+function builtins.unset(args)
+	for _, name in ipairs(args) do
+		Shell.variables[name] = nil
+	end
+	Shell.exitStatus = 0
+end
+
+function builtins.set(args)
+	if #args == 0 then
+		local sorted = {}
+		for name in pairs(Shell.variables) do
+			table.insert(sorted, name)
+		end
+		table.sort(sorted)
+
+		for _, name in ipairs(sorted) do
+			cepheus.term.print(string.format("%s=%s", name, Shell.variables[name]))
+		end
+		Shell.exitStatus = 0
+		return
+	end
+
+	Shell.exitStatus = 0
+end
+
+function builtins.alias(args)
+	if #args == 0 then
+		for name, value in pairs(Shell.aliases) do
+			cepheus.term.print(string.format("alias %s='%s'", name, value))
+		end
+		Shell.exitStatus = 0
+		return
+	end
+
+	local aliasStr = table.concat(args, " ")
+	local name, value = aliasStr:match("^([^=]+)=(.*)$")
+
+	if name and value then
+		value = value:gsub("^['\"]", ""):gsub("['\"]$", "")
+		Shell.aliases[name] = value
+		Shell.exitStatus = 0
+	else
+		if Shell.aliases[args[1]] then
+			cepheus.term.print(string.format("alias %s='%s'", args[1], Shell.aliases[args[1]]))
+			Shell.exitStatus = 0
+		else
+			cepheus.term.printError("alias: " .. args[1] .. ": not found")
+			Shell.exitStatus = 1
+		end
+	end
+end
+
+function builtins.unalias(args)
+	if #args == 0 then
+		cepheus.term.printError("unalias: missing argument")
+		Shell.exitStatus = 1
+		return
+	end
+
+	local parsed = cepheus.parsing.parseArgs(args)
+
+	if cepheus.parsing.hasFlag(parsed, "a") then
+		Shell.aliases = {}
+		Shell.exitStatus = 0
+		return
+	end
+
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
+	for _, name in ipairs(positional) do
+		if Shell.aliases[name] then
+			Shell.aliases[name] = nil
+		else
+			cepheus.term.printError("unalias: " .. name .. ": not found")
+			Shell.exitStatus = 1
+			return
+		end
+	end
+
+	Shell.exitStatus = 0
+end
+
+function builtins.type(args)
+	for _, cmd in ipairs(args) do
+		if builtins[cmd] then
+			cepheus.term.print(cmd .. " is a shell builtin")
+		elseif Shell.aliases[cmd] then
+			cepheus.term.print(cmd .. " is aliased to `" .. Shell.aliases[cmd] .. "'")
+		elseif Shell.functions[cmd] then
+			cepheus.term.print(cmd .. " is a function")
+		else
+			local path = resolveProgram(cmd)
+			if path then
+				cepheus.term.print(cmd .. " is " .. path)
+			else
+				cepheus.term.printError(cmd .. ": not found")
+				Shell.exitStatus = 1
+			end
+		end
+	end
+	Shell.exitStatus = 0
+end
+
+function builtins.which(args)
+	local parsed = cepheus.parsing.parseArgs(args)
+	local showAll = cepheus.parsing.hasFlag(parsed, "a")
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
+
+	for _, cmd in ipairs(positional) do
+		if builtins[cmd] then
+			if not showAll then
+				cepheus.term.print("shell built-in command")
+			end
+		elseif Shell.aliases[cmd] then
+			if not showAll then
+				cepheus.term.print("alias for " .. Shell.aliases[cmd])
 			end
 		else
-			cepheus.term.print(fs.getName(target))
+			local path = resolveProgram(cmd)
+			if path then
+				cepheus.term.print(path)
+			else
+				Shell.exitStatus = 1
+			end
 		end
+	end
+end
+
+function builtins.exit(args)
+	local code = tonumber(args[1]) or Shell.exitStatus
+	error("exit:" .. code)
+end
+
+function builtins.logout(args)
+	error("exit:0")
+end
+
+builtins["return"] = function(args)
+	local code = tonumber(args[1]) or Shell.exitStatus
+	Shell.exitStatus = code
+end
+
+builtins["true"] = function(args)
+	Shell.exitStatus = 0
+end
+
+builtins["false"] = function(args)
+	Shell.exitStatus = 1
+end
+
+function builtins.test(args)
+	if #args == 0 then
+		Shell.exitStatus = 1
 		return
 	end
 
-	local items = fs.list(target)
+	if args[1] == "-e" and args[2] then
+		Shell.exitStatus = fs.exists(resolvePath(args[2])) and 0 or 1
+	elseif args[1] == "-f" and args[2] then
+		local path = resolvePath(args[2])
+		Shell.exitStatus = (fs.exists(path) and not fs.isDir(path)) and 0 or 1
+	elseif args[1] == "-d" and args[2] then
+		local path = resolvePath(args[2])
+		Shell.exitStatus = (fs.exists(path) and fs.isDir(path)) and 0 or 1
+	elseif args[1] == "-r" and args[2] then
+		Shell.exitStatus = fs.exists(resolvePath(args[2])) and 0 or 1
+	elseif args[1] == "-w" and args[2] then
+		Shell.exitStatus = fs.exists(resolvePath(args[2])) and 0 or 1
+	elseif args[1] == "-z" and args[2] then
+		Shell.exitStatus = (#args[2] == 0) and 0 or 1
+	elseif args[1] == "-n" and args[2] then
+		Shell.exitStatus = (#args[2] > 0) and 0 or 1
+	elseif #args == 3 then
+		if args[2] == "=" or args[2] == "==" then
+			Shell.exitStatus = (args[1] == args[3]) and 0 or 1
+		elseif args[2] == "!=" then
+			Shell.exitStatus = (args[1] ~= args[3]) and 0 or 1
+		elseif args[2] == "-eq" then
+			Shell.exitStatus = (tonumber(args[1]) == tonumber(args[3])) and 0 or 1
+		elseif args[2] == "-ne" then
+			Shell.exitStatus = (tonumber(args[1]) ~= tonumber(args[3])) and 0 or 1
+		elseif args[2] == "-lt" then
+			Shell.exitStatus = (tonumber(args[1]) < tonumber(args[3])) and 0 or 1
+		elseif args[2] == "-le" then
+			Shell.exitStatus = (tonumber(args[1]) <= tonumber(args[3])) and 0 or 1
+		elseif args[2] == "-gt" then
+			Shell.exitStatus = (tonumber(args[1]) > tonumber(args[3])) and 0 or 1
+		elseif args[2] == "-ge" then
+			Shell.exitStatus = (tonumber(args[1]) >= tonumber(args[3])) and 0 or 1
+		else
+			Shell.exitStatus = 1
+		end
+	else
+		Shell.exitStatus = 1
+	end
+end
+
+function builtins.history(args)
+	local parsed = cepheus.parsing.parseArgs(args)
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
+
+	if cepheus.parsing.hasFlag(parsed, "c") then
+		Shell.history = {}
+		Shell.exitStatus = 0
+		return
+	end
+
+	local count = tonumber(positional[1]) or #Shell.history
+	local start = math.max(1, #Shell.history - count + 1)
+
+	for i = start, #Shell.history do
+		cepheus.term.print(string.format("%4d  %s", i, Shell.history[i]))
+	end
+	Shell.exitStatus = 0
+end
+
+function builtins.jobs(args)
+	local hasJobs = false
+	for jobId, job in pairs(Shell.jobs) do
+		hasJobs = true
+		local status = job.running and "Running" or "Stopped"
+		cepheus.term.print(string.format("[%d]  %s  %s", jobId, status, job.command))
+	end
+
+	if not hasJobs then
+	end
+
+	Shell.exitStatus = 0
+end
+
+function builtins.fg(args)
+	local jobId = tonumber(args[1]) or Shell.nextJobId - 1
+
+	if not Shell.jobs[jobId] then
+		cepheus.term.printError("fg: job not found")
+		Shell.exitStatus = 1
+		return
+	end
+
+	cepheus.term.print(Shell.jobs[jobId].command)
+	Shell.jobs[jobId] = nil
+	Shell.exitStatus = 0
+end
+
+function builtins.bg(args)
+	local jobId = tonumber(args[1]) or Shell.nextJobId - 1
+
+	if not Shell.jobs[jobId] then
+		cepheus.term.printError("bg: job not found")
+		Shell.exitStatus = 1
+		return
+	end
+
+	Shell.jobs[jobId].running = true
+	cepheus.term.print(string.format("[%d]  %s", jobId, Shell.jobs[jobId].command))
+	Shell.exitStatus = 0
+end
+
+function builtins.source(args)
+	if #args == 0 then
+		cepheus.term.printError("source: missing file argument")
+		Shell.exitStatus = 1
+		return
+	end
+
+	local path = resolvePath(args[1])
+	if not fs.exists(path) then
+		cepheus.term.printError("source: " .. path .. ": No such file or directory")
+		Shell.exitStatus = 1
+		return
+	end
+
+	local file = fs.open(path, "r")
+	if not file then
+		cepheus.term.printError("source: cannot open " .. path)
+		Shell.exitStatus = 1
+		return
+	end
+
+	local content = file.readAll()
+	file.close()
+
+	for line in content:gmatch("[^\n]+") do
+		line = line:match("^%s*(.-)%s*$")
+		if #line > 0 and not line:match("^#") then
+			executeCommand(line)
+		end
+	end
+
+	Shell.exitStatus = 0
+end
+
+builtins["."] = builtins.source
+
+function builtins.exec(args)
+	if #args == 0 then
+		Shell.exitStatus = 0
+		return
+	end
+
+	local commandLine = table.concat(args, " ")
+	executeCommand(commandLine)
+end
+
+function builtins.eval(args)
+	local commandLine = table.concat(args, " ")
+	executeCommand(commandLine)
+end
+
+function builtins.shift(args)
+	local n = tonumber(args[1]) or 1
+
+	Shell.exitStatus = 0
+end
+
+function builtins.read(args)
+	local parsed = cepheus.parsing.parseArgs(args)
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
+
+	local prompt = cepheus.parsing.getArg(parsed, "p")
+	if prompt then
+		cepheus.term.write(prompt)
+	end
+
+	local input = cepheus.term.read()
+
+	if #positional > 0 then
+		local words = {}
+		for word in input:gmatch("%S+") do
+			table.insert(words, word)
+		end
+
+		for i, varname in ipairs(positional) do
+			if i < #positional then
+				Shell.variables[varname] = words[i] or ""
+			else
+				local remaining = {}
+				for j = i, #words do
+					table.insert(remaining, words[j])
+				end
+				Shell.variables[varname] = table.concat(remaining, " ")
+			end
+		end
+	else
+		Shell.variables.REPLY = input
+	end
+
+	Shell.exitStatus = 0
+end
+
+function builtins.sleep(args)
+	local duration = tonumber(args[1])
+	if not duration then
+		cepheus.term.printError("sleep: invalid time interval")
+		Shell.exitStatus = 1
+		return
+	end
+
+	sleep(duration)
+	Shell.exitStatus = 0
+end
+
+function builtins.time(args)
+	local start = os.epoch("utc")
+	local commandLine = table.concat(args, " ")
+	executeCommand(commandLine)
+	local elapsed = os.epoch("utc") - start
+
+	cepheus.term.printError(string.format("\nreal\t%.3fs", elapsed / 1000))
+	Shell.exitStatus = 0
+end
+
+function builtins.help(args)
+	if #args > 0 then
+		local cmd = args[1]
+		if builtins[cmd] then
+			cepheus.term.print("Help for: " .. cmd)
+		else
+			cepheus.term.printError("help: no help topics match `" .. cmd .. "'")
+			Shell.exitStatus = 1
+			return
+		end
+	else
+		cepheus.term.pager({
+			"AndromedaOS Shell - Built-in Commands",
+			"",
+			"File Operations:",
+			"  cd [dir]         - Change directory (use - for previous)",
+			"  pwd [-L|-P]      - Print working directory",
+			"  ls [options]     - List directory contents",
+			"  cat [files]      - Display file contents",
+			"  cp src dst       - Copy files",
+			"  mv src dst       - Move/rename files",
+			"  rm [files]       - Remove files",
+			"  mkdir [dirs]     - Create directories",
+			"  rmdir [dirs]     - Remove empty directories",
+			"  touch [files]    - Create empty files",
+			"",
+			"Text Processing:",
+			"  grep pattern     - Search for pattern in input",
+			"  head [-n N]      - Output first N lines (default 10)",
+			"  tail [-n N]      - Output last N lines (default 10)",
+			"  wc [-l|-w|-c]    - Count lines, words, or characters",
+			"",
+			"Output:",
+			"  echo [-n] [text] - Print text (use -n to omit newline)",
+			"  printf fmt [args]- Format and print",
+			"",
+			"Variables:",
+			"  export VAR=val   - Set and export environment variable",
+			"  unset VAR        - Unset variable",
+			"  set              - Display all variables",
+			"  read [-p prompt] - Read input into variable",
+			"",
+			"Aliases:",
+			"  alias name=cmd   - Create command alias",
+			"  unalias [-a] name- Remove alias",
+			"",
+			"Command Info:",
+			"  type cmd         - Display command type",
+			"  which cmd        - Show command path",
+			"  help [cmd]       - Display help",
+			"",
+			"Job Control:",
+			"  jobs             - List background jobs",
+			"  fg [job]         - Bring job to foreground",
+			"  bg [job]         - Continue job in background",
+			"",
+			"Control Flow:",
+			"  test expr        - Evaluate expression",
+			"  true             - Return success (0)",
+			"  false            - Return failure (1)",
+			"  exit [n]         - Exit shell with code",
+			"  return [n]       - Return from function",
+			"",
+			"Script Execution:",
+			"  source file      - Execute file in current shell",
+			"  . file           - Same as source",
+			"  exec cmd         - Replace shell with command",
+			"  eval args        - Evaluate arguments as command",
+			"",
+			"Utilities:",
+			"  history [-c]     - Show/clear command history",
+			"  sleep n          - Sleep for n seconds",
+			"  time cmd         - Time command execution",
+			"  clear            - Clear the screen",
+			"",
+			"Features:",
+			"  Pipes:        cmd1 | cmd2 | cmd3",
+			"  Redirects:    cmd > file, cmd >> file, cmd < file",
+			"  Error redir:  cmd 2> errors.txt, cmd 2>&1",
+			"  Background:   cmd &",
+			"  Chains:       cmd1 && cmd2  (AND)",
+			"               cmd1 || cmd2  (OR)",
+			"               cmd1 ; cmd2   (sequential)",
+			"  Variables:    $VAR, ${VAR}, $?, $$, $!",
+			"  Globs:        *.lua, file?.txt",
+			"  Braces:       {a,b,c}, {1..10}",
+			"  History:      !!, !n, !$",
+			"  Tilde:        ~, ~/dir",
+		}, "Help")
+	end
+	Shell.exitStatus = 0
+end
+
+function builtins.ls(args)
+	local parsed = cepheus.parsing.parseArgs(args)
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
+
+	local showAll = cepheus.parsing.hasFlag(parsed, "a")
+	local longFormat = cepheus.parsing.hasFlag(parsed, "l")
+	local humanReadable = cepheus.parsing.hasFlag(parsed, "h")
+
+	local path = #positional > 0 and resolvePath(positional[1]) or Shell.currentDir
+
+	if not fs.exists(path) then
+		cepheus.term.printError("ls: cannot access '" .. path .. "': No such file or directory")
+		Shell.exitStatus = 1
+		return
+	end
+
+	if not fs.isDir(path) then
+		cepheus.term.print(fs.getName(path))
+		Shell.exitStatus = 0
+		return
+	end
+
+	local files = fs.list(path)
+	table.sort(files)
 
 	if not showAll then
 		local filtered = {}
-		for _, item in ipairs(items) do
-			if not item:match("^%.") then
-				table.insert(filtered, item)
+		for _, file in ipairs(files) do
+			if file:sub(1, 1) ~= "." then
+				table.insert(filtered, file)
 			end
 		end
-		items = filtered
-	end
-
-	table.sort(items)
-
-	if #items == 0 then
-		return
+		files = filtered
 	end
 
 	if longFormat then
-		for _, item in ipairs(items) do
-			local fullPath = fs.combine(target, item)
+		for _, file in ipairs(files) do
+			local fullPath = fs.combine(path, file)
 			local stat = cepheus.perms.stat(fullPath)
 
 			if stat then
@@ -258,37 +1085,70 @@ function builtins.ls(rawArgs)
 					ownerName = ownerInfo.username or "unknown"
 				end
 
+				local groupName = ownerName
+
 				local perms = cepheus.perms.formatPerms(stat.perms)
 				local typeChar = stat.isDir and "d" or "-"
 
-				local flags = ""
+				local permStr = perms
 				if stat.hasSetuid then
-					flags = flags .. "s"
+					local ux = perms:sub(3, 3)
+					permStr = perms:sub(1, 2) .. (ux == "x" and "s" or "S") .. perms:sub(4)
 				end
 				if stat.hasSetgid then
-					flags = flags .. "g"
+					local gx = perms:sub(6, 6)
+					permStr = permStr:sub(1, 5) .. (gx == "x" and "s" or "S") .. permStr:sub(7)
 				end
 				if stat.hasSticky then
-					flags = flags .. "t"
+					local ox = perms:sub(9, 9)
+					permStr = permStr:sub(1, 8) .. (ox == "x" and "t" or "T")
 				end
 
-				local displayName = item
+				local links = 1
+
+				local sizeStr
+				if humanReadable then
+					if stat.size >= 1073741824 then
+						sizeStr = string.format("%4.1fG", stat.size / 1073741824)
+					elseif stat.size >= 1048576 then
+						sizeStr = string.format("%4.1fM", stat.size / 1048576)
+					elseif stat.size >= 1024 then
+						sizeStr = string.format("%4.1fK", stat.size / 1024)
+					else
+						sizeStr = string.format("%5d", stat.size)
+					end
+				else
+					sizeStr = tostring(stat.size)
+				end
+
+				local timestamp
+				if os.date then
+					timestamp = os.date("%b %d %H:%M")
+				else
+					timestamp = "Jan  1 00:00"
+				end
+
+				local displayName = file
+				local colorCode = ""
+				local resetCode = ""
+
 				if stat.isDir then
 					if term.isColor() then
 						term.setTextColor(cepheus.colors.cyan)
 					end
-					displayName = item .. "/"
+					displayName = file
 				end
 
 				cepheus.term.print(
 					string.format(
-						"%s%s%-2s %-8s %4d %8d %s",
+						"%s%s %2d %-8s %-8s %5s %s %s",
 						typeChar,
-						perms,
-						flags,
+						permStr,
+						links,
 						ownerName:sub(1, 8),
-						stat.gid,
-						stat.size,
+						groupName:sub(1, 8),
+						sizeStr,
+						timestamp,
 						displayName
 					)
 				)
@@ -302,9 +1162,9 @@ function builtins.ls(rawArgs)
 		local w, h = term.getSize()
 		local maxWidth = 0
 
-		for _, item in ipairs(items) do
-			if #item > maxWidth then
-				maxWidth = #item
+		for _, file in ipairs(files) do
+			if #file > maxWidth then
+				maxWidth = #file
 			end
 		end
 
@@ -314,17 +1174,17 @@ function builtins.ls(rawArgs)
 		end
 
 		local col = 0
-		for _, item in ipairs(items) do
-			local fullPath = fs.combine(target, item)
+		for _, file in ipairs(files) do
+			local fullPath = fs.combine(path, file)
 			local color = term.getTextColor()
 
 			if fs.isDir(fullPath) then
 				if term.isColor() then
 					term.setTextColor(cepheus.colors.cyan)
 				end
-				term.write(item .. "/")
+				term.write(file .. "/")
 			else
-				term.write(item)
+				term.write(file)
 			end
 
 			term.setTextColor(color)
@@ -334,7 +1194,7 @@ function builtins.ls(rawArgs)
 				cepheus.term.print("")
 				col = 0
 			else
-				term.write(string.rep(" ", maxWidth + 2 - #item - (fs.isDir(fullPath) and 1 or 0)))
+				term.write(string.rep(" ", maxWidth + 2 - #file - (fs.isDir(fullPath) and 1 or 0)))
 			end
 		end
 
@@ -342,75 +1202,58 @@ function builtins.ls(rawArgs)
 			cepheus.term.print("")
 		end
 	end
+
+	Shell.exitStatus = 0
 end
 
-function builtins.mkdir(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-
+function builtins.cat(args)
 	if #args == 0 then
-		cepheus.term.printError("Usage: mkdir <directory>")
-		return
-	end
-
-	local path = resolvePath(args[1])
-
-	if fs.exists(path) then
-		cepheus.term.printError("mkdir: " .. args[1] .. ": File exists")
-		return
-	end
-
-	local parent = fs.getDir(path)
-	if not cepheus.perms.checkAccess(parent, cepheus.perms.PERMS.WRITE) then
-		cepheus.term.printError("mkdir: Permission denied")
-		return
-	end
-
-	fs.makeDir(path)
-
-	local user = cepheus.users.getCurrentUser()
-	if user then
-		cepheus.perms.chown(path, user.uid, user.gid)
-		cepheus.perms.chmod(path, 0x1ED)
-	end
-end
-
-function builtins.rm(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-	local recursive = cepheus.parsing.hasFlag(parsed, "r", { "recursive" })
-	local force = cepheus.parsing.hasFlag(parsed, "f", { "force" })
-
-	if #args == 0 then
-		cepheus.term.printError("Usage: rm [-rf] <file>")
-		return
-	end
-
-	for _, file in ipairs(args) do
-		local path = resolvePath(file)
-
-		if not fs.exists(path) then
-			if not force then
-				cepheus.term.printError("rm: " .. file .. ": No such file or directory")
-			end
-		else
-			if not cepheus.perms.checkAccess(path, cepheus.perms.PERMS.WRITE) then
-				cepheus.term.printError("rm: " .. file .. ": Permission denied")
-			elseif fs.isDir(path) and not recursive then
-				cepheus.term.printError("rm: " .. file .. ": Is a directory (use -r for recursive)")
-			else
-				fs.delete(path)
+		local stdin = cepheus.sched.get_stdin()
+		if stdin and stdin.readLine then
+			local line = stdin:readLine()
+			while line do
+				cepheus.term.print(line)
+				line = stdin:readLine()
 			end
 		end
+		Shell.exitStatus = 0
+		return
 	end
+
+	for _, arg in ipairs(args) do
+		local path = resolvePath(arg)
+		if not fs.exists(path) then
+			cepheus.term.printError("cat: " .. arg .. ": No such file or directory")
+			Shell.exitStatus = 1
+			return
+		end
+
+		if fs.isDir(path) then
+			cepheus.term.printError("cat: " .. arg .. ": Is a directory")
+			Shell.exitStatus = 1
+			return
+		end
+
+		local file = fs.open(path, "r")
+		if not file then
+			cepheus.term.printError("cat: " .. arg .. ": Permission denied")
+			Shell.exitStatus = 1
+			return
+		end
+
+		local content = file.readAll()
+		file.close()
+
+		cepheus.term.write(content)
+	end
+
+	Shell.exitStatus = 0
 end
 
-function builtins.cp(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-
+function builtins.cp(args)
 	if #args < 2 then
-		cepheus.term.printError("Usage: cp <source> <destination>")
+		cepheus.term.printError("cp: missing file operand")
+		Shell.exitStatus = 1
 		return
 	end
 
@@ -418,38 +1261,29 @@ function builtins.cp(rawArgs)
 	local dst = resolvePath(args[2])
 
 	if not fs.exists(src) then
-		cepheus.term.printError("cp: " .. args[1] .. ": No such file or directory")
+		cepheus.term.printError("cp: cannot stat '" .. args[1] .. "': No such file or directory")
+		Shell.exitStatus = 1
 		return
 	end
 
-	if not cepheus.perms.checkAccess(src, cepheus.perms.PERMS.READ) then
-		cepheus.term.printError("cp: " .. args[1] .. ": Permission denied")
+	if fs.isDir(src) then
+		cepheus.term.printError("cp: -r not specified; omitting directory '" .. args[1] .. "'")
+		Shell.exitStatus = 1
 		return
 	end
 
-	local dstDir = fs.isDir(dst) and dst or fs.getDir(dst)
-	if not cepheus.perms.checkAccess(dstDir, cepheus.perms.PERMS.WRITE) then
-		cepheus.term.printError("cp: " .. args[2] .. ": Permission denied")
-		return
+	if fs.exists(dst) and fs.isDir(dst) then
+		dst = fs.combine(dst, fs.getName(src))
 	end
 
 	fs.copy(src, dst)
-
-	local srcStat = cepheus.perms.stat(src)
-	if srcStat then
-		local user = cepheus.users.getCurrentUser()
-		if user then
-			cepheus.perms.init(dst, user.uid, user.gid, srcStat.perms)
-		end
-	end
+	Shell.exitStatus = 0
 end
 
-function builtins.mv(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-
+function builtins.mv(args)
 	if #args < 2 then
-		cepheus.term.printError("Usage: mv <source> <destination>")
+		cepheus.term.printError("mv: missing file operand")
+		Shell.exitStatus = 1
 		return
 	end
 
@@ -457,548 +1291,446 @@ function builtins.mv(rawArgs)
 	local dst = resolvePath(args[2])
 
 	if not fs.exists(src) then
-		cepheus.term.printError("mv: " .. args[1] .. ": No such file or directory")
+		cepheus.term.printError("mv: cannot stat '" .. args[1] .. "': No such file or directory")
+		Shell.exitStatus = 1
 		return
 	end
 
-	if not cepheus.perms.checkAccess(fs.getDir(src), cepheus.perms.PERMS.WRITE) then
-		cepheus.term.printError("mv: " .. args[1] .. ": Permission denied")
-		return
-	end
-
-	local dstDir = fs.isDir(dst) and dst or fs.getDir(dst)
-	if not cepheus.perms.checkAccess(dstDir, cepheus.perms.PERMS.WRITE) then
-		cepheus.term.printError("mv: " .. args[2] .. ": Permission denied")
-		return
+	if fs.exists(dst) and fs.isDir(dst) then
+		dst = fs.combine(dst, fs.getName(src))
 	end
 
 	fs.move(src, dst)
+	Shell.exitStatus = 0
 end
 
-function builtins.chmod(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-
-	if #args < 2 then
-		cepheus.term.printError("Usage: chmod <mode> <file>")
-		cepheus.term.print("Example: chmod 755 file.txt")
+function builtins.rm(args)
+	if #args == 0 then
+		cepheus.term.printError("rm: missing operand")
+		Shell.exitStatus = 1
 		return
 	end
 
-	local mode = tonumber(args[1])
-	if not mode then
-		cepheus.term.printError("chmod: invalid mode: " .. args[1])
-		return
-	end
+	local parsed = cepheus.parsing.parseArgs(args)
+	local recursive = cepheus.parsing.hasFlag(parsed, "r") or cepheus.parsing.hasFlag(parsed, "R")
+	local force = cepheus.parsing.hasFlag(parsed, "f")
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
 
-	for i = 2, #args do
-		local path = resolvePath(args[i])
+	for _, arg in ipairs(positional) do
+		local path = resolvePath(arg)
 
 		if not fs.exists(path) then
-			cepheus.term.printError("chmod: " .. args[i] .. ": No such file or directory")
+			if not force then
+				cepheus.term.printError("rm: cannot remove '" .. arg .. "': No such file or directory")
+				Shell.exitStatus = 1
+			end
+			goto continue
+		end
+
+		if fs.isDir(path) and not recursive then
+			cepheus.term.printError("rm: cannot remove '" .. arg .. "': Is a directory")
+			Shell.exitStatus = 1
+			goto continue
+		end
+
+		fs.delete(path)
+
+		::continue::
+	end
+
+	Shell.exitStatus = 0
+end
+
+function builtins.mkdir(args)
+	if #args == 0 then
+		cepheus.term.printError("mkdir: missing operand")
+		Shell.exitStatus = 1
+		return
+	end
+
+	local parsed = cepheus.parsing.parseArgs(args)
+	local makeParents = cepheus.parsing.hasFlag(parsed, "p")
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
+
+	for _, arg in ipairs(positional) do
+		local path = resolvePath(arg)
+
+		if fs.exists(path) then
+			cepheus.term.printError("mkdir: cannot create directory '" .. arg .. "': File exists")
+			Shell.exitStatus = 1
+			goto continue
+		end
+
+		if makeParents then
+			local parts = {}
+			for part in path:gmatch("[^/]+") do
+				table.insert(parts, part)
+			end
+
+			local current = path:sub(1, 1) == "/" and "/" or ""
+			for _, part in ipairs(parts) do
+				current = fs.combine(current, part)
+				if not fs.exists(current) then
+					fs.makeDir(current)
+				end
+			end
 		else
-			local success, err = pcall(cepheus.perms.chmod, path, mode)
-			if not success then
-				cepheus.term.printError("chmod: " .. tostring(err))
+			fs.makeDir(path)
+		end
+
+		::continue::
+	end
+
+	Shell.exitStatus = 0
+end
+
+function builtins.rmdir(args)
+	if #args == 0 then
+		cepheus.term.printError("rmdir: missing operand")
+		Shell.exitStatus = 1
+		return
+	end
+
+	for _, arg in ipairs(args) do
+		local path = resolvePath(arg)
+
+		if not fs.exists(path) then
+			cepheus.term.printError("rmdir: failed to remove '" .. arg .. "': No such file or directory")
+			Shell.exitStatus = 1
+			goto continue
+		end
+
+		if not fs.isDir(path) then
+			cepheus.term.printError("rmdir: failed to remove '" .. arg .. "': Not a directory")
+			Shell.exitStatus = 1
+			goto continue
+		end
+
+		local files = fs.list(path)
+		if #files > 0 then
+			cepheus.term.printError("rmdir: failed to remove '" .. arg .. "': Directory not empty")
+			Shell.exitStatus = 1
+			goto continue
+		end
+
+		fs.delete(path)
+
+		::continue::
+	end
+
+	Shell.exitStatus = 0
+end
+
+function builtins.touch(args)
+	if #args == 0 then
+		cepheus.term.printError("touch: missing file operand")
+		Shell.exitStatus = 1
+		return
+	end
+
+	for _, arg in ipairs(args) do
+		local path = resolvePath(arg)
+
+		if not fs.exists(path) then
+			local file = fs.open(path, "w")
+			if file then
+				file.close()
+			else
+				cepheus.term.printError("touch: cannot touch '" .. arg .. "': Permission denied")
+				Shell.exitStatus = 1
 			end
 		end
 	end
+
+	Shell.exitStatus = 0
 end
 
-function builtins.chown(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-
-	if #args < 2 then
-		cepheus.term.printError("Usage: chown <user:group> <file>")
+function builtins.grep(args)
+	if #args == 0 then
+		cepheus.term.printError("grep: missing pattern")
+		Shell.exitStatus = 1
 		return
 	end
 
-	local ownerStr = args[1]
-	local username, groupStr = ownerStr:match("^([^:]+):?(.*)$")
-
-	if not username then
-		cepheus.term.printError("chown: invalid owner specification")
-		return
-	end
-
-	local userInfo = cepheus.users.getUserInfo(username)
-	if not userInfo then
-		cepheus.term.printError("chown: invalid user: " .. username)
-		return
-	end
-
-	local uid = userInfo.uid
-	local gid = groupStr ~= "" and tonumber(groupStr) or userInfo.gid
-
+	local pattern = args[1]
+	local files = {}
 	for i = 2, #args do
-		local path = resolvePath(args[i])
+		table.insert(files, args[i])
+	end
 
-		if not fs.exists(path) then
-			cepheus.term.printError("chown: " .. args[i] .. ": No such file or directory")
-		else
-			local success, err = pcall(cepheus.perms.chown, path, uid, gid)
-			if not success then
-				cepheus.term.printError("chown: " .. tostring(err))
+	local function grepContent(content, showFilename, filename)
+		local matched = false
+		for line in content:gmatch("[^\n]*\n?") do
+			line = line:gsub("\n$", "")
+			if line:match(pattern) then
+				if showFilename then
+					cepheus.term.print(filename .. ":" .. line)
+				else
+					cepheus.term.print(line)
+				end
+				matched = true
 			end
 		end
-	end
-end
-
-function builtins.stat(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-
-	if #args == 0 then
-		cepheus.term.printError("Usage: stat <file>")
-		return
+		return matched
 	end
 
-	local path = resolvePath(args[1])
-
-	if not fs.exists(path) then
-		cepheus.term.printError("stat: " .. args[1] .. ": No such file or directory")
-		return
-	end
-
-	local stat = cepheus.perms.stat(path)
-	if not stat then
-		cepheus.term.printError("stat: Could not retrieve file information")
-		return
-	end
-
-	local ownerName = "unknown"
-	local userInfo = cepheus.users.getUserInfo(stat.uid)
-	if userInfo then
-		ownerName = userInfo.username or "unknown"
-	end
-
-	cepheus.term.print(string.format("File: %s", args[1]))
-	cepheus.term.print(string.format("Size: %d bytes", stat.size))
-	cepheus.term.print(string.format("Type: %s", stat.isDir and "directory" or "file"))
-	cepheus.term.print(string.format("Permissions: %s (%03d)", cepheus.perms.formatPerms(stat.perms), stat.perms))
-	cepheus.term.print(string.format("Owner: %s (UID: %d)", ownerName, stat.uid))
-	cepheus.term.print(string.format("Group: %d", stat.gid))
-
-	if stat.hasSetuid or stat.hasSetgid or stat.hasSticky then
-		local flags = {}
-		if stat.hasSetuid then
-			table.insert(flags, "setuid")
+	if #files == 0 then
+		local stdin = cepheus.sched.get_stdin()
+		if stdin and stdin.readAll then
+			local content = stdin:readAll()
+			if not grepContent(content, false, nil) then
+				Shell.exitStatus = 1
+			end
 		end
-		if stat.hasSetgid then
-			table.insert(flags, "setgid")
-		end
-		if stat.hasSticky then
-			table.insert(flags, "sticky")
-		end
-		cepheus.term.print(string.format("Special flags: %s", table.concat(flags, ", ")))
-	end
-end
-
-function builtins.setflags(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-
-	if #args < 2 then
-		cepheus.term.printError("Usage: setflags <file> <flag> [on|off]")
-		cepheus.term.print("Flags: setuid, setgid, sticky")
-		return
-	end
-
-	local path = resolvePath(args[1])
-	local flag = args[2]
-	local value = args[3] ~= "off"
-
-	if not fs.exists(path) then
-		cepheus.term.printError("setflags: " .. args[1] .. ": No such file or directory")
-		return
-	end
-
-	if flag ~= "setuid" and flag ~= "setgid" and flag ~= "sticky" then
-		cepheus.term.printError("setflags: invalid flag: " .. flag)
-		return
-	end
-
-	local success, err = pcall(cepheus.perms.setFlags, path, flag, value)
-	if not success then
-		cepheus.term.printError("setflags: " .. tostring(err))
 	else
-		cepheus.term.print(string.format("Set %s %s on %s", flag, value and "on" or "off", args[1]))
-	end
-end
+		local anyMatched = false
+		for _, arg in ipairs(files) do
+			local path = resolvePath(arg)
+			if not fs.exists(path) then
+				cepheus.term.printError("grep: " .. arg .. ": No such file or directory")
+				Shell.exitStatus = 2
+				goto continue
+			end
 
-function builtins.ps(rawArgs)
-	local tasks = cepheus.sched.list_tasks()
+			if fs.isDir(path) then
+				cepheus.term.printError("grep: " .. arg .. ": Is a directory")
+				Shell.exitStatus = 2
+				goto continue
+			end
 
-	cepheus.term.print(string.format("%-6s %-10s %-8s %-8s %-10s", "PID", "STATE", "PRIORITY", "OWNER", "CPU"))
+			local file = fs.open(path, "r")
+			if not file then
+				cepheus.term.printError("grep: " .. arg .. ": Permission denied")
+				Shell.exitStatus = 2
+				goto continue
+			end
 
-	for _, task in ipairs(tasks) do
-		cepheus.term.print(
-			string.format("%-6d %-10s %-8d %-8d %-10.2f", task.pid, task.state, task.priority, task.owner, task.cpu)
-		)
-	end
-end
+			local content = file.readAll()
+			file.close()
 
-function builtins.kill(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs, { valueArgs = { s = true, signal = true } })
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-	local signal = tonumber(cepheus.parsing.getArg(parsed, "s", nil, { "signal" }))
+			if grepContent(content, #files > 1, arg) then
+				anyMatched = true
+			end
 
-	if #args == 0 then
-		cepheus.term.printError("Usage: kill [-s <signal>] <pid>")
-		return
-	end
-
-	local pid = tonumber(args[1])
-	if not pid then
-		cepheus.term.printError("kill: invalid PID")
-		return
-	end
-
-	local success, err = pcall(cepheus.sched.kill, pid, signal)
-	if not success then
-		cepheus.term.printError("kill: " .. tostring(err))
-	else
-		cepheus.term.print("Killed task " .. pid)
-	end
-end
-
-function builtins.whoami(rawArgs)
-	local user = cepheus.users.getCurrentUser()
-	if user then
-		cepheus.term.print(user.username)
-	else
-		cepheus.term.print("unknown")
-	end
-end
-
-function builtins.id(rawArgs)
-	local user = cepheus.users.getCurrentUser()
-	if not user then
-		cepheus.term.printError("Not logged in")
-		return
-	end
-
-	cepheus.term.print(string.format("uid=%d(%s) gid=%d", user.uid, user.username, user.gid))
-
-	local caps = cepheus.users.getUserCapabilities(user.username)
-	if #caps > 0 then
-		cepheus.term.print("capabilities: " .. table.concat(caps, ", "))
-	end
-end
-
-function builtins.su(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-
-	local targetUser = args[1] or "root"
-
-	local userInfo = cepheus.users.getUserInfo(targetUser)
-	if not userInfo then
-		cepheus.term.printError("su: user '" .. targetUser .. "' does not exist")
-		return
-	end
-
-	term.write("Password: ")
-	local password = cepheus.term.read("*")
-	cepheus.term.print("")
-
-	if not cepheus.users.authenticate(targetUser, password) then
-		cepheus.term.printError("su: Authentication failed")
-		return
-	end
-
-	local currentPid = cepheus.sched.current_pid()
-	if currentPid > 0 and cepheus.sched._tasks[currentPid] then
-		local task = cepheus.sched._tasks[currentPid]
-		task.euid = userInfo.uid
-		task.egid = userInfo.gid or 0
-		task.owner = userInfo.uid
-		task.gid = userInfo.gid or 0
-
-		if userInfo.home and fs.exists(userInfo.home) then
-			Shell.currentDir = userInfo.home
+			::continue::
 		end
 
-		cepheus.term.print("Switched to user: " .. targetUser)
-	else
-		cepheus.term.printError("su: Cannot switch user (not in task context)")
-	end
-end
-
-function builtins.useradd(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs, { valueArgs = { p = true, password = true } })
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-	local password = cepheus.parsing.getArg(parsed, "p", nil, { "password" })
-
-	if #args == 0 then
-		cepheus.term.printError("Usage: useradd [-p <password>] <username>")
-		return
-	end
-
-	local username = args[1]
-
-	if not password then
-		term.write("Password: ")
-		password = cepheus.term.read("*")
-	end
-
-	local success, err = pcall(function()
-		return cepheus.users.createUser(username, password)
-	end)
-
-	if not success then
-		cepheus.term.printError("useradd: " .. tostring(err))
-	else
-		cepheus.term.print("User " .. username .. " created")
-	end
-end
-
-function builtins.userdel(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-
-	if #args == 0 then
-		cepheus.term.printError("Usage: userdel <username>")
-		return
-	end
-
-	local username = args[1]
-
-	local success, err = pcall(function()
-		return cepheus.users.deleteUser(username)
-	end)
-end
-
-function builtins.users(rawArgs)
-	cepheus.term.print(string.format("%-15s %-6s %-6s", "USERNAME", "UID", "GID"))
-
-	local usernames = cepheus.users.listUsers()
-
-	local userList = {}
-	for _, username in ipairs(usernames) do
-		local userInfo = cepheus.users.getUserInfo(username)
-		if userInfo then
-			table.insert(userList, userInfo)
+		if not anyMatched then
+			Shell.exitStatus = 1
 		end
 	end
 
-	table.sort(userList, function(a, b)
-		return a.uid < b.uid
-	end)
-
-	for _, userInfo in ipairs(userList) do
-		cepheus.term.print(string.format("%-15s %-6d %-6d", userInfo.username, userInfo.uid, userInfo.gid))
-	end
+	Shell.exitStatus = Shell.exitStatus or 0
 end
 
-function builtins.grant(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
+function builtins.head(args)
+	local parsed = cepheus.parsing.parseArgs(args, { valueArgs = { n = true } })
+	local lines = tonumber(cepheus.parsing.getArg(parsed, "n", 10))
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
 
-	if #args < 2 then
-		cepheus.term.printError("Usage: grant <username> <capability>")
-		cepheus.term.print("Available capabilities:")
-		for _, cap in pairs(cepheus.users.CAPS) do
-			cepheus.term.print("  " .. cap)
+	local function headContent(content)
+		local count = 0
+		for line in content:gmatch("[^\n]*\n?") do
+			if count >= lines then
+				break
+			end
+			cepheus.term.write(line)
+			count = count + 1
 		end
-		return
 	end
 
-	local username = args[1]
-	local capability = args[2]
-
-	local success, err = pcall(function()
-		return cepheus.users.grantCap(username, capability)
-	end)
-
-	if not success then
-		cepheus.term.printError("grant: " .. tostring(err))
+	if #positional == 0 then
+		local stdin = cepheus.sched.get_stdin()
+		if stdin and stdin.readAll then
+			headContent(stdin:readAll())
+		end
 	else
-		cepheus.term.print("Granted " .. capability .. " to " .. username)
+		for _, arg in ipairs(positional) do
+			local path = resolvePath(arg)
+			if not fs.exists(path) then
+				cepheus.term.printError("head: cannot open '" .. arg .. "' for reading: No such file or directory")
+				Shell.exitStatus = 1
+				goto continue
+			end
+
+			local file = fs.open(path, "r")
+			if not file then
+				cepheus.term.printError("head: cannot open '" .. arg .. "' for reading: Permission denied")
+				Shell.exitStatus = 1
+				goto continue
+			end
+
+			headContent(file.readAll())
+			file.close()
+
+			::continue::
+		end
 	end
+
+	Shell.exitStatus = 0
 end
 
-function builtins.revoke(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
+function builtins.tail(args)
+	local parsed = cepheus.parsing.parseArgs(args, { valueArgs = { n = true } })
+	local lines = tonumber(cepheus.parsing.getArg(parsed, "n", 10))
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
 
-	if #args < 2 then
-		cepheus.term.printError("Usage: revoke <username> <capability>")
-		return
+	local function tailContent(content)
+		local allLines = {}
+		for line in content:gmatch("[^\n]*\n?") do
+			table.insert(allLines, line)
+		end
+
+		local start = math.max(1, #allLines - lines + 1)
+		for i = start, #allLines do
+			cepheus.term.write(allLines[i])
+		end
 	end
 
-	local username = args[1]
-	local capability = args[2]
-
-	local success, err = pcall(function()
-		return cepheus.users.revokeCap(username, capability)
-	end)
-
-	if not success then
-		cepheus.term.printError("revoke: " .. tostring(err))
+	if #positional == 0 then
+		local stdin = cepheus.sched.get_stdin()
+		if stdin and stdin.readAll then
+			tailContent(stdin:readAll())
+		end
 	else
-		cepheus.term.print("Revoked " .. capability .. " from " .. username)
+		for _, arg in ipairs(positional) do
+			local path = resolvePath(arg)
+			if not fs.exists(path) then
+				cepheus.term.printError("tail: cannot open '" .. arg .. "' for reading: No such file or directory")
+				Shell.exitStatus = 1
+				goto continue
+			end
+
+			local file = fs.open(path, "r")
+			if not file then
+				cepheus.term.printError("tail: cannot open '" .. arg .. "' for reading: Permission denied")
+				Shell.exitStatus = 1
+				goto continue
+			end
+
+			tailContent(file.readAll())
+			file.close()
+
+			::continue::
+		end
 	end
+
+	Shell.exitStatus = 0
 end
 
-function builtins.clear(rawArgs)
+function builtins.wc(args)
+	local parsed = cepheus.parsing.parseArgs(args)
+	local countLines = cepheus.parsing.hasFlag(parsed, "l")
+	local countWords = cepheus.parsing.hasFlag(parsed, "w")
+	local countChars = cepheus.parsing.hasFlag(parsed, "c")
+	local positional = cepheus.parsing.getPositionalArgs(parsed)
+
+	if not countLines and not countWords and not countChars then
+		countLines = true
+		countWords = true
+		countChars = true
+	end
+
+	local function wcContent(content, filename)
+		local lines = 0
+		local words = 0
+		local chars = #content
+
+		for line in content:gmatch("[^\n]*\n?") do
+			lines = lines + 1
+			for word in line:gmatch("%S+") do
+				words = words + 1
+			end
+		end
+
+		local output = {}
+		if countLines then
+			table.insert(output, tostring(lines))
+		end
+		if countWords then
+			table.insert(output, tostring(words))
+		end
+		if countChars then
+			table.insert(output, tostring(chars))
+		end
+		if filename then
+			table.insert(output, filename)
+		end
+
+		cepheus.term.print(table.concat(output, " "))
+	end
+
+	if #positional == 0 then
+		local stdin = cepheus.sched.get_stdin()
+		if stdin and stdin.readAll then
+			wcContent(stdin:readAll(), nil)
+		end
+	else
+		for _, arg in ipairs(positional) do
+			local path = resolvePath(arg)
+			if not fs.exists(path) then
+				cepheus.term.printError("wc: " .. arg .. ": No such file or directory")
+				Shell.exitStatus = 1
+				goto continue
+			end
+
+			local file = fs.open(path, "r")
+			if not file then
+				cepheus.term.printError("wc: " .. arg .. ": Permission denied")
+				Shell.exitStatus = 1
+				goto continue
+			end
+
+			wcContent(file.readAll(), arg)
+			file.close()
+
+			::continue::
+		end
+	end
+
+	Shell.exitStatus = 0
+end
+
+function builtins.clear(args)
 	term.clear()
 	term.setCursorPos(1, 1)
+	Shell.exitStatus = 0
 end
 
-function builtins.echo(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-	cepheus.term.print(table.concat(args, " "))
-end
-
-function builtins.uptime(rawArgs)
-	local uptime = os.clock()
-	local hours = math.floor(uptime / 3600)
-	local minutes = math.floor((uptime % 3600) / 60)
-	local seconds = math.floor(uptime % 60)
-
-	cepheus.term.print(string.format("up %dh %dm %ds", hours, minutes, seconds))
-end
-
-function builtins.uname(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local showAll = cepheus.parsing.hasFlag(parsed, "a", { "all" })
-
-	if showAll then
-		local info = {}
-		table.insert(info, os.version and os.version() or "AndromedaOS")
-		table.insert(info, getHostname())
-		table.insert(info, "ComputerCraft")
-		cepheus.term.print(table.concat(info, " "))
-	else
-		if os.version then
-			cepheus.term.print(os.version())
-		else
-			cepheus.term.print("AndromedaOS")
-		end
-	end
-end
-
-function builtins.exit(rawArgs)
-	cepheus.term.print("Goodbye!")
-	os.shutdown()
-end
-
-function builtins.reboot(rawArgs)
-	os.reboot()
-end
-
-function builtins.alias(rawArgs)
-	local parsed = cepheus.parsing.parseArgs(rawArgs)
-	local args = cepheus.parsing.getPositionalArgs(parsed)
-
-	if #args == 0 then
-		for name, value in pairs(Shell.aliases) do
-			cepheus.term.print(name .. "=" .. value)
-		end
-	elseif #args == 1 then
-		if Shell.aliases[args[1]] then
-			cepheus.term.print(args[1] .. "=" .. Shell.aliases[args[1]])
-		else
-			cepheus.term.printError("alias: " .. args[1] .. ": not found")
-		end
-	else
-		local name = args[1]
-		local value = table.concat(args, " ", 2)
-		Shell.aliases[name] = value
-	end
-end
-
-function builtins.help(rawArgs)
-	local helpText = {
-		"Available built-in commands:",
-		"",
-		"Navigation:",
-		"  cd [dir]         - Change directory",
-		"  pwd              - Print working directory",
-		"  ls [-la] [dir]   - List directory contents",
-		"",
-		"File Operations:",
-		"  mkdir <dir>      - Create directory",
-		"  rm [-rf] <file>  - Remove file/directory",
-		"  cp <src> <dst>   - Copy file",
-		"  mv <src> <dst>   - Move/rename file",
-		"",
-		"File Permissions:",
-		"  chmod <mode> <f> - Change permissions (e.g., chmod 755 file)",
-		"  chown <u:g> <f>  - Change owner[:group]",
-		"  stat <file>      - Show file info",
-		"  setflag <f> <fl> - Set setuid/setgid/sticky",
-		"",
-		"Process Management:",
-		"  ps               - List all processes",
-		"  kill [-s] <pid>  - Kill a process",
-		"",
-		"User Management:",
-		"  whoami           - Print current user",
-		"  id               - Print user ID and capabilities",
-		"  su [user]        - Switch user (default: root)",
-		"  useradd [-p] <u> - Create user",
-		"  userdel <user>   - Delete user",
-		"  users            - List all users",
-		"  grant <u> <c>    - Grant capability (root only)",
-		"  revoke <u> <c>   - Revoke capability (root only)",
-		"",
-		"System:",
-		"  clear            - Clear the screen",
-		"  echo <text>      - Print text",
-		"  uptime           - Show system uptime",
-		"  uname [-a]       - Show OS version",
-		"  free             - Show memory info",
-		"  alias [n] [cmd]  - Set or list aliases",
-		"  exit             - Shutdown the system",
-		"  reboot           - Reboot the system",
-		"  help             - Show this help",
-	}
-
-	cepheus.term.pager(helpText, "Shell Help")
-end
-
-local function completeFunction(text)
-	if not text or text == "" or text:match("^%s+$") then
+local function completeFunction(line)
+	if not line or line:match("^%s*$") then
 		return {}
 	end
 
+	local args = parseCommandLine(line)
 	local completions = {}
-	local args = parseCommandLine(text)
 
-	if #args == 0 or (#args == 1 and not text:match("%s$")) then
+	if #args == 0 or (#args == 1 and not line:match("%s$")) then
 		local partial = args[1] or ""
 
-		if partial == "" or partial:match("^%s+$") then
+		if partial == "" then
 			return {}
 		end
 
-		for cmd in pairs(builtins) do
-			if cmd:sub(1, #partial) == partial then
-				table.insert(completions, cmd:sub(#partial + 1))
-			end
-		end
-
-		for pathDir in Shell.path:gmatch("[^:]+") do
-			if fs.exists(pathDir) and fs.isDir(pathDir) then
-				for _, file in ipairs(fs.list(pathDir)) do
-					local fullPath = fs.combine(pathDir, file)
-					if not fs.isDir(fullPath) then
-						local name = file:gsub("%.lua$", "")
-						if name:sub(1, #partial) == partial then
-							table.insert(completions, name:sub(#partial + 1))
-						end
-					end
-				end
+		for builtin in pairs(builtins) do
+			if builtin:sub(1, #partial) == partial then
+				table.insert(completions, builtin:sub(#partial + 1))
 			end
 		end
 
 		for alias in pairs(Shell.aliases) do
 			if alias:sub(1, #partial) == partial then
 				table.insert(completions, alias:sub(#partial + 1))
+			end
+		end
+
+		for pathDir in Shell.path:gmatch("[^:]+") do
+			if fs.exists(pathDir) and fs.isDir(pathDir) then
+				for _, file in ipairs(fs.list(pathDir)) do
+					if file:sub(1, #partial) == partial then
+						table.insert(completions, file:sub(#partial + 1))
+					end
+				end
 			end
 		end
 	else
@@ -1032,45 +1764,136 @@ local function completeFunction(text)
 	return completions
 end
 
-local function executeCommand(commandLine)
-	commandLine = commandLine:match("^%s*(.-)%s*$")
+local function executeCommandInPipeline(cmdSpec, stdinStream, stdoutStream, stderrStream)
+	local args = parseCommandLine(cmdSpec.cmd)
 
-	if commandLine == "" then
-		return
+	if #args == 0 then
+		return 0
 	end
 
-	if #Shell.history == 0 or Shell.history[#Shell.history] ~= commandLine then
-		table.insert(Shell.history, commandLine)
-		if #Shell.history > Shell.maxHistory then
-			table.remove(Shell.history, 1)
+	local expandedArgs = {}
+	for _, arg in ipairs(args) do
+		local braceExpanded = expandBraces(arg)
+		for _, bArg in ipairs(braceExpanded) do
+			local globExpanded = expandGlob(bArg)
+			for _, gArg in ipairs(globExpanded) do
+				table.insert(expandedArgs, gArg)
+			end
 		end
 	end
 
-	local args = parseCommandLine(commandLine)
-	if #args == 0 then
-		return
-	end
-
+	args = expandedArgs
 	local command = args[1]
 	table.remove(args, 1)
 
+	if cmdSpec.stdin then
+		local filename = resolvePath(cmdSpec.stdin)
+		if not fs.exists(filename) then
+			cepheus.term.printError(command .. ": " .. filename .. ": No such file or directory")
+			return 1
+		end
+
+		local file = fs.open(filename, "r")
+		if not file then
+			cepheus.term.printError(command .. ": cannot open " .. filename)
+			return 1
+		end
+
+		stdinStream = FileStream.new(file)
+	end
+
+	if cmdSpec.stdout then
+		local filename = resolvePath(cmdSpec.stdout)
+		local mode = cmdSpec.append and "a" or "w"
+
+		local file = fs.open(filename, mode)
+		if not file then
+			cepheus.term.printError(command .. ": cannot create " .. filename)
+			return 1
+		end
+
+		stdoutStream = FileStream.new(file)
+	end
+
+	if cmdSpec.stderr == "stdout" then
+		stderrStream = stdoutStream
+	elseif cmdSpec.stderr then
+		local filename = resolvePath(cmdSpec.stderr)
+		local file = fs.open(filename, "w")
+		if not file then
+			cepheus.term.printError(command .. ": cannot create " .. filename)
+			return 1
+		end
+
+		stderrStream = FileStream.new(file)
+	end
+
 	if builtins[command] then
+		local oldStdin = cepheus.sched.get_stdin()
+		local oldStdout = cepheus.sched.get_stdout()
+		local oldStderr = cepheus.sched.get_stderr()
+
+		cepheus.sched.set_stdin(nil, stdinStream)
+		cepheus.sched.set_stdout(nil, stdoutStream)
+		cepheus.sched.set_stderr(nil, stderrStream)
+
 		builtins[command](args)
-		return
+
+		cepheus.sched.set_stdin(nil, oldStdin)
+		cepheus.sched.set_stdout(nil, oldStdout)
+		cepheus.sched.set_stderr(nil, oldStderr)
+
+		if stdinStream and stdinStream.close and cmdSpec.stdin then
+			stdinStream:close()
+		end
+		if stdoutStream and stdoutStream.close and cmdSpec.stdout then
+			stdoutStream:close()
+		end
+		if stderrStream and stderrStream.close and cmdSpec.stderr and cmdSpec.stderr ~= "stdout" then
+			stderrStream:close()
+		end
+
+		return Shell.exitStatus
+	end
+
+	if Shell.functions[command] then
+		local oldStdin = cepheus.sched.get_stdin()
+		local oldStdout = cepheus.sched.get_stdout()
+		local oldStderr = cepheus.sched.get_stderr()
+
+		cepheus.sched.set_stdin(nil, stdinStream)
+		cepheus.sched.set_stdout(nil, stdoutStream)
+		cepheus.sched.set_stderr(nil, stderrStream)
+
+		for _, line in ipairs(Shell.functions[command]) do
+			executeCommand(line)
+		end
+
+		cepheus.sched.set_stdin(nil, oldStdin)
+		cepheus.sched.set_stdout(nil, oldStdout)
+		cepheus.sched.set_stderr(nil, oldStderr)
+
+		if stdinStream and stdinStream.close and cmdSpec.stdin then
+			stdinStream:close()
+		end
+		if stdoutStream and stdoutStream.close and cmdSpec.stdout then
+			stdoutStream:close()
+		end
+		if stderrStream and stderrStream.close and cmdSpec.stderr and cmdSpec.stderr ~= "stdout" then
+			stderrStream:close()
+		end
+
+		return Shell.exitStatus
 	end
 
 	local programPath = resolveProgram(command)
 
 	if not programPath then
 		cepheus.term.printError(command .. ": command not found")
-		return
+		return 127
 	end
 
-	local effectiveUid = cepheus.users.getEffectiveUid(programPath)
-
-	local oldDir = Shell.currentDir
 	local oldShell = _G.shell
-
 	_G.shell = {
 		dir = function()
 			return Shell.currentDir
@@ -1096,48 +1919,217 @@ local function executeCommand(commandLine)
 	if programPath:match("%.app$") then
 		local infoPath = fs.combine(programPath, "Contents/Info.json")
 		if not fs.exists(infoPath) then
-			cepheus.term.printError(command .. ": invalid .app bundle (missing Contents/Info.json)")
+			cepheus.term.printError(command .. ": invalid .app bundle")
 			_G.shell = oldShell
-			return
+			return 1
 		end
 
 		local infoFile = fs.open(infoPath, "r")
 		if not infoFile then
 			cepheus.term.printError(command .. ": cannot read Info.json")
 			_G.shell = oldShell
-			return
+			return 1
 		end
 		local infoContent = infoFile.readAll()
 		infoFile.close()
 
 		local info = cepheus.json.decode(infoContent)
 		if not info or not info.PList or not info.PList.Entry then
-			cepheus.term.printError(command .. ": invalid Info.json (missing PList.Entry)")
+			cepheus.term.printError(command .. ": invalid Info.json")
 			_G.shell = oldShell
-			return
+			return 1
 		end
 
 		entryPoint = fs.combine(programPath, "Contents/" .. info.PList.Entry)
 		if not fs.exists(entryPoint) then
-			cepheus.term.printError(command .. ": entry point not found: " .. entryPoint)
+			cepheus.term.printError(command .. ": entry point not found")
 			_G.shell = oldShell
-			return
+			return 1
 		end
 	end
 
 	local success, err = pcall(function()
 		local pid = cepheus.sched.spawnF(entryPoint, table.unpack(args))
 		if pid then
-			cepheus.sched.wait(pid)
+			cepheus.sched.set_stdin(pid, stdinStream)
+			cepheus.sched.set_stdout(pid, stdoutStream)
+			cepheus.sched.set_stderr(pid, stderrStream)
+
+			local exitCode = cepheus.sched.wait(pid)
+			Shell.exitStatus = exitCode or 0
 		else
 			cepheus.term.printError("Could not create process")
+			Shell.exitStatus = 1
 		end
 	end)
 
 	_G.shell = oldShell
 
+	if stdinStream and stdinStream.close and cmdSpec.stdin then
+		stdinStream:close()
+	end
+	if stdoutStream and stdoutStream.close and cmdSpec.stdout then
+		stdoutStream:close()
+	end
+	if stderrStream and stderrStream.close and cmdSpec.stderr and cmdSpec.stderr ~= "stdout" then
+		stderrStream:close()
+	end
+
 	if not success then
 		cepheus.term.printError(err)
+		return 1
+	end
+
+	return Shell.exitStatus
+end
+
+local function executePipeline(pipeline)
+	if #pipeline == 0 then
+		return 0
+	end
+
+	if #pipeline == 1 then
+		local exitCode = executeCommandInPipeline(pipeline[1], nil, nil, nil)
+		Shell.exitStatus = exitCode
+		return exitCode
+	end
+
+	local pipes = {}
+
+	for i = 1, #pipeline - 1 do
+		pipes[i] = PipeBuffer.new()
+	end
+
+	for i, cmdSpec in ipairs(pipeline) do
+		local stdinSource = i > 1 and pipes[i - 1] or nil
+		local stdoutTarget = i < #pipeline and pipes[i] or nil
+
+		local exitCode = executeCommandInPipeline(cmdSpec, stdinSource, stdoutTarget, nil)
+
+		if stdinSource then
+			stdinSource:close()
+		end
+
+		if i < #pipeline then
+		else
+			Shell.exitStatus = exitCode
+		end
+	end
+
+	return Shell.exitStatus
+end
+
+local function executeCommand(commandLine)
+	commandLine = commandLine:match("^%s*(.-)%s*$")
+
+	if commandLine == "" then
+		return
+	end
+
+	if commandLine:sub(1, 1) == "#" then
+		return
+	end
+
+	if commandLine:sub(1, 1) == "!" then
+		if commandLine == "!!" and #Shell.history > 0 then
+			commandLine = Shell.history[#Shell.history]
+			cepheus.term.print(commandLine)
+		elseif commandLine:match("^!%d+$") then
+			local num = tonumber(commandLine:sub(2))
+			if num and Shell.history[num] then
+				commandLine = Shell.history[num]
+				cepheus.term.print(commandLine)
+			else
+				cepheus.term.printError("bash: !" .. num .. ": event not found")
+				Shell.exitStatus = 1
+				return
+			end
+		elseif commandLine == "!$" and #Shell.history > 0 then
+			local lastCmd = Shell.history[#Shell.history]
+			local lastArgs = parseCommandLine(lastCmd)
+			if #lastArgs > 0 then
+				commandLine = lastArgs[#lastArgs]
+				cepheus.term.print(commandLine)
+			end
+		end
+	end
+
+	if #Shell.history == 0 or Shell.history[#Shell.history] ~= commandLine then
+		table.insert(Shell.history, commandLine)
+		if #Shell.history > Shell.maxHistory then
+			table.remove(Shell.history, 1)
+		end
+	end
+
+	local commands = {}
+	local currentCmd = ""
+	local i = 1
+	local inQuotes = false
+	local quoteChar = nil
+
+	while i <= #commandLine do
+		local char = commandLine:sub(i, i)
+		local nextChar = commandLine:sub(i + 1, i + 1)
+
+		if inQuotes then
+			if char == quoteChar then
+				inQuotes = false
+				quoteChar = nil
+			end
+			currentCmd = currentCmd .. char
+		elseif char == '"' or char == "'" then
+			inQuotes = true
+			quoteChar = char
+			currentCmd = currentCmd .. char
+		elseif char == "&" and nextChar == "&" then
+			table.insert(commands, { cmd = currentCmd, op = "&&" })
+			currentCmd = ""
+			i = i + 1
+		elseif char == "|" and nextChar == "|" then
+			table.insert(commands, { cmd = currentCmd, op = "||" })
+			currentCmd = ""
+			i = i + 1
+		elseif char == ";" then
+			table.insert(commands, { cmd = currentCmd, op = ";" })
+			currentCmd = ""
+		else
+			currentCmd = currentCmd .. char
+		end
+
+		i = i + 1
+	end
+
+	if currentCmd:match("%S") then
+		table.insert(commands, { cmd = currentCmd, op = nil })
+	end
+
+	for _, cmdData in ipairs(commands) do
+		local shouldExecute = true
+
+		if cmdData.op == "&&" then
+			shouldExecute = (Shell.exitStatus == 0)
+		elseif cmdData.op == "||" then
+			shouldExecute = (Shell.exitStatus ~= 0)
+		end
+
+		if shouldExecute then
+			local pipeline = parseCommandPipeline(cmdData.cmd)
+
+			if #pipeline > 0 and pipeline[#pipeline].background then
+				pipeline[#pipeline].background = false
+				local jobId = Shell.nextJobId
+				Shell.nextJobId = Shell.nextJobId + 1
+				Shell.jobs[jobId] = {
+					command = cmdData.cmd,
+					running = true,
+					pid = nil,
+				}
+				Shell.lastBackgroundPid = jobId
+				cepheus.term.print(string.format("[%d] %d", jobId, jobId))
+			else
+				executePipeline(pipeline)
+			end
+		end
 	end
 end
 
@@ -1149,9 +2141,14 @@ local function shellLoop()
 	cepheus.term.print("Type 'help' for available commands")
 	cepheus.term.print("")
 
+	local rcPath = fs.combine(Shell.variables.HOME, ".shellrc")
+	if fs.exists(rcPath) then
+		builtins.source({ rcPath })
+	end
+
 	while true do
 		local username = getUsername()
-		local prompt = username == "root" and "#" or "%"
+		local prompt = username == "root" and "#" or "$"
 		local displayPath = getDisplayPath()
 
 		if term.isColor() then
@@ -1178,7 +2175,7 @@ local function shellLoop()
 			if username == "root" then
 				term.setTextColor(cepheus.colors.red)
 			else
-				term.setTextColor(cepheus.colors.white)
+				term.setTextColor(cepheus.colors.green)
 			end
 		end
 		term.write(prompt .. " ")
@@ -1189,7 +2186,14 @@ local function shellLoop()
 
 		local command = cepheus.term.read(nil, Shell.history, completeFunction)
 
-		executeCommand(command)
+		local success, err = pcall(executeCommand, command)
+		if not success and not err:match("^exit:") then
+			cepheus.term.printError("Shell error: " .. tostring(err))
+			Shell.exitStatus = 1
+		elseif err and err:match("^exit:") then
+			local code = tonumber(err:match("exit:(%d+)")) or 0
+			break
+		end
 	end
 end
 

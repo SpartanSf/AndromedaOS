@@ -330,6 +330,14 @@ local ARGS_VERBOSE = cepheus.parsing.hasFlag(parsedArgs, "verbose", { "v" })
 function cepheus.term.write(sText)
 	expect(1, sText, "string", "number")
 
+	if cepheus.sched then
+		local stdout = cepheus.sched.get_stdout()
+		if stdout and stdout.write then
+			stdout:write(tostring(sText))
+			return 0
+		end
+	end
+
 	local w, h = term.getSize()
 	local x, y = term.getCursorPos()
 	local nLinesPrinted = 0
@@ -395,6 +403,19 @@ end
 -- @param ... Values to print
 -- @return number Total lines printed
 function cepheus.term.print(...)
+	if cepheus.sched then
+		local stdout = cepheus.sched.get_stdout()
+		if stdout and stdout.writeLine then
+			local nArgs = select("#", ...)
+			local parts = {}
+			for i = 1, nArgs do
+				table.insert(parts, tostring(select(i, ...)))
+			end
+			stdout:writeLine(table.concat(parts, "\t"))
+			return 0
+		end
+	end
+
 	local nLinesPrinted = 0
 	local nArgs = select("#", ...)
 
@@ -414,9 +435,36 @@ function cepheus.term.print(...)
 	return nLinesPrinted
 end
 
+local _originalTermWrite = term.write
+
+function term.write(text)
+	if cepheus.sched then
+		local stdout = cepheus.sched.get_stdout()
+		if stdout and stdout.write then
+			stdout:write(tostring(text))
+			return
+		end
+	end
+
+	_originalTermWrite(tostring(text))
+end
+
 --- Prints error messages in red (if color supported)
 -- @param ... Values to print as error
 function cepheus.term.printError(...)
+	if cepheus.sched then
+		local stderr = cepheus.sched.get_stderr()
+		if stderr and stderr.writeLine then
+			local nArgs = select("#", ...)
+			local parts = {}
+			for i = 1, nArgs do
+				table.insert(parts, tostring(select(i, ...)))
+			end
+			stderr:writeLine(table.concat(parts, "\t"))
+			return
+		end
+	end
+
 	local oldColour
 
 	if term.isColour() then
@@ -442,6 +490,14 @@ function cepheus.term.read(sReplaceChar, tHistory, fnComplete, sDefault)
 	expect(2, tHistory, "table", "nil")
 	expect(3, fnComplete, "function", "nil")
 	expect(4, sDefault, "string", "nil")
+
+	if cepheus.sched then
+		local stdin = cepheus.sched.get_stdin()
+		if stdin and stdin.readLine then
+			local line = stdin:readLine()
+			return line or ""
+		end
+	end
 
 	term.setCursorBlink(true)
 
@@ -2392,63 +2448,63 @@ end
 
 function _wrappedFs.exists(path)
 	path = _originalFs.combine(path)
-    if not checkPathTraversal(path) then
-        return false
-    end
+	if not checkPathTraversal(path) then
+		return false
+	end
 
-    if path == "/" or path == "" then
-        return _originalFs.exists(path)
-    end
+	if path == "/" or path == "" then
+		return _originalFs.exists(path)
+	end
 
-    local parent = _originalFs.getDir(path)
-    if parent == "" then
-        parent = "/"
-    end
-    if parent ~= "/" then
-        if not checkPermission(parent, cepheus.perms.PERMS.EXEC) then
-            return false
-        end
-    end
+	local parent = _originalFs.getDir(path)
+	if parent == "" then
+		parent = "/"
+	end
+	if parent ~= "/" then
+		if not checkPermission(parent, cepheus.perms.PERMS.EXEC) then
+			return false
+		end
+	end
 
-    if _originalFs.exists(path) and _originalFs.isDir(path) then
-        if not checkPermission(path, cepheus.perms.PERMS.EXEC) then
-            return false
-        end
-    end
+	if _originalFs.exists(path) and _originalFs.isDir(path) then
+		if not checkPermission(path, cepheus.perms.PERMS.EXEC) then
+			return false
+		end
+	end
 
-    return _originalFs.exists(path)
+	return _originalFs.exists(path)
 end
 
 function _wrappedFs.isDir(path)
 	path = _originalFs.combine(path)
-    if not checkPathTraversal(path) then
-        return false
-    end
+	if not checkPathTraversal(path) then
+		return false
+	end
 
-    if path == "/" or path == "" then
-        return _originalFs.isDir(path)
-    end
+	if path == "/" or path == "" then
+		return _originalFs.isDir(path)
+	end
 
-    local parent = _originalFs.getDir(path)
-    if parent == "" then
-        parent = "/"
-    end
-    if parent ~= "/" then
-        if not checkPermission(parent, cepheus.perms.PERMS.EXEC) then
-            return false
-        end
-    end
+	local parent = _originalFs.getDir(path)
+	if parent == "" then
+		parent = "/"
+	end
+	if parent ~= "/" then
+		if not checkPermission(parent, cepheus.perms.PERMS.EXEC) then
+			return false
+		end
+	end
 
-    if not _originalFs.exists(path) then
-        return false
-    end
+	if not _originalFs.exists(path) then
+		return false
+	end
 
-    local isDir = _originalFs.isDir(path)
-    if isDir and not checkPermission(path, cepheus.perms.PERMS.EXEC) then
-        return false
-    end
+	local isDir = _originalFs.isDir(path)
+	if isDir and not checkPermission(path, cepheus.perms.PERMS.EXEC) then
+		return false
+	end
 
-    return isDir
+	return isDir
 end
 
 function _wrappedFs.getSize(path)
@@ -2601,6 +2657,11 @@ function cepheus.sched.spawn(func, ...)
 
 	local args = { ... }
 
+	local parentTask = cepheus.sched._tasks[cepheus.sched._currentPid]
+	local stdin = parentTask and parentTask.stdin or nil
+	local stdout = parentTask and parentTask.stdout or nil
+	local stderr = parentTask and parentTask.stderr or nil
+
 	cepheus.sched._tasks[pid] = {
 		pid = pid,
 		state = cepheus.sched.STATE.READY,
@@ -2625,6 +2686,9 @@ function cepheus.sched.spawn(func, ...)
 		blockReason = nil,
 		eventFilter = nil,
 		hasStarted = false,
+		stdin = stdin,
+		stdout = stdout,
+		stderr = stderr,
 	}
 
 	if cepheus.sched._currentPid ~= 0 and cepheus.sched._tasks[cepheus.sched._currentPid] then
@@ -2998,6 +3062,114 @@ function cepheus.sched.get_priority(pid)
 	end
 
 	return task.priority
+end
+
+--- Set stdin for a task
+-- @param pid PID (or nil for current task)
+-- @param stream Stream object with read/readLine/readAll methods
+function cepheus.sched.set_stdin(pid, stream)
+	pid = pid or cepheus.sched.current_pid()
+	expect(1, pid, "number")
+
+	local task = cepheus.sched._tasks[pid]
+	if not task then
+		error("No such task: " .. pid)
+		return
+	end
+
+	if not cepheus.users.isRoot() and task.owner ~= cepheus.users.getCurrentUser().uid then
+		error("Permission denied: not task owner")
+		return
+	end
+
+	task.stdin = stream
+end
+
+--- Set stdout for a task
+-- @param pid PID (or nil for current task)
+-- @param stream Stream object with write/writeLine methods
+function cepheus.sched.set_stdout(pid, stream)
+	pid = pid or cepheus.sched.current_pid()
+	expect(1, pid, "number")
+
+	local task = cepheus.sched._tasks[pid]
+	if not task then
+		error("No such task: " .. pid)
+		return
+	end
+
+	if not cepheus.users.isRoot() and task.owner ~= cepheus.users.getCurrentUser().uid then
+		error("Permission denied: not task owner")
+		return
+	end
+
+	task.stdout = stream
+end
+
+--- Set stderr for a task
+-- @param pid PID (or nil for current task)
+-- @param stream Stream object with write/writeLine methods
+function cepheus.sched.set_stderr(pid, stream)
+	pid = pid or cepheus.sched.current_pid()
+	expect(1, pid, "number")
+
+	local task = cepheus.sched._tasks[pid]
+	if not task then
+		error("No such task: " .. pid)
+		return
+	end
+
+	if not cepheus.users.isRoot() and task.owner ~= cepheus.users.getCurrentUser().uid then
+		error("Permission denied: not task owner")
+		return
+	end
+
+	task.stderr = stream
+end
+
+--- Get stdin for a task
+-- @param pid PID (or nil for current task)
+-- @return Stream object or nil
+function cepheus.sched.get_stdin(pid)
+	pid = pid or cepheus.sched.current_pid()
+	expect(1, pid, "number")
+
+	local task = cepheus.sched._tasks[pid]
+	if not task then
+		return nil
+	end
+
+	return task.stdin
+end
+
+--- Get stdout for a task
+-- @param pid PID (or nil for current task)
+-- @return Stream object or nil
+function cepheus.sched.get_stdout(pid)
+	pid = pid or cepheus.sched.current_pid()
+	expect(1, pid, "number")
+
+	local task = cepheus.sched._tasks[pid]
+	if not task then
+		return nil
+	end
+
+	return task.stdout
+end
+
+--- Get stderr for a task
+-- @param pid PID (or nil for current task)
+-- @return Stream object or nil
+function cepheus.sched.get_stderr(pid)
+	pid = pid or cepheus.sched.current_pid()
+	expect(1, pid, "number")
+
+	local task = cepheus.sched._tasks[pid]
+	if not task then
+		return nil
+	end
+
+	return task.stderr
 end
 
 --- Pause a task
